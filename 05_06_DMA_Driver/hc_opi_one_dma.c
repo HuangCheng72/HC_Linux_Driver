@@ -4,7 +4,7 @@
 
 /*
  * Copyright (C) 2024 huangcheng
- * Author: huangcheng <huangcheng20000702@google.com>
+ * Author: huangcheng <huangcheng20000702@gmail.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -381,7 +381,7 @@ typedef struct hc_sun6i_dma_descriptor {
 
 // 驱动使用的DMA任务描述符，实际上就是简单包装一下DMA_HardWare_Descriptor，获取相关信息的时候方便一些，并继承Linux内核DMA驱动框架的虚拟通道描述符
 typedef struct hc_dma_task_descriptor {
-    struct virt_dma_desc    vd;             // 虚拟通道描述符，用于和Linux内核DMA驱动框架交互
+    struct virt_dma_desc    vd;             // Linux内核的虚拟DMA框架的DMA任务描述符，继承这个，就可以让Linux内核自动管理这个描述符
     dma_addr_t * physical_addr;             // 描述符的物理地址
     DMA_HardWare_Descriptor * virtual_addr; // 描述符的虚拟地址
 } DMA_TASK_Descriptor;
@@ -460,6 +460,34 @@ static int hc_dma_alloc_chan_resources(struct dma_chan *chan);
 static void hc_dma_free_chan_resources(struct dma_chan *chan);
 static int hc_dma_start_transfer(struct dma_chan *chan);
 static void hc_dma_stop_transfer(struct dma_chan *chan);
+
+// 以下是平台驱动匹配信息
+
+// 目前只支持Allwinner H3平台，所以也只有这个了
+DMA_Config sun8i_h3_dma_cfg = {
+        .max_physical_channels = 12,    // 技术手册里面说了物理通道数就12
+        .max_virtual_channels = 30,     // Linux内核里面sun6i的DMA驱动用的数值是34，不懂怎么回事，可能是测试出来的经验数据，我这里取个整数30
+        .max_requests = 27              // 最大的DRQ端口ID，因为最后一个有实际意义的只到26，后面都没有意义，所以定为27
+};
+
+// 匹配设备树中的`compatible`字段，通过这个，找到对应的结点
+static struct of_device_id hc_dma_of_match[] = {
+        { .compatible = "allwinner,sun8i-h3-dma", .data = &sun8i_h3_dma_cfg },
+        { },
+};
+MODULE_DEVICE_TABLE(of, hc_dma_of_match);
+
+// 平台驱动结构体，通过of_match_table来匹配到对应的结点，进而载入平台设备
+static struct platform_driver hc_dma_driver = {
+        .probe = hc_dma_probe,
+        .remove = hc_dma_remove,
+        .driver = {
+                .name = DEVICE_NAME,
+                .of_match_table = hc_dma_of_match,
+                .owner = THIS_MODULE,
+        },
+};
+module_platform_driver(hc_dma_driver);
 
 // 以下是函数实现
 
@@ -649,32 +677,7 @@ static void hc_dma_stop_transfer(struct dma_chan *chan) {
     // 3. 将通道状态更新为停止。
 }
 
-
-// 目前只支持Allwinner H3平台，所以也只有这个了
-DMA_Config sun8i_h3_dma_cfg = {
-        .max_physical_channels = 12,    // 技术手册里面说了物理通道数就12
-        .max_virtual_channels = 34,     // 不懂，可能是测试出来的经验数据
-        .max_requests = 27              // 最大的DRQ端口ID，因为最后一个有实际意义的只到26，后面都没有意义，所以定为27
-};
-
-// 匹配设备树中的`compatible`字段，通过这个，找到对应的结点
-static struct of_device_id hc_dma_of_match[] = {
-        { .compatible = "allwinner,sun8i-h3-dma", .data = &sun8i_h3_dma_cfg },
-        { },
-};
-MODULE_DEVICE_TABLE(of, hc_dma_of_match);
-
-// 平台驱动结构体，通过of_match_table来匹配到对应的结点，进而载入平台设备
-static struct platform_driver hc_dma_driver = {
-        .probe = hc_dma_probe,
-        .remove = hc_dma_remove,
-        .driver = {
-                .name = DEVICE_NAME,
-                .of_match_table = hc_dma_of_match,
-                .owner = THIS_MODULE,
-        },
-};
-module_platform_driver(hc_dma_driver);
+// 以下是驱动作者信息和描述、版本、许可证信息
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("huangcheng, <huangcheng20000702@gmail.com> ");
