@@ -491,18 +491,308 @@ module_platform_driver(hc_dma_driver);
 
 // 以下是函数实现
 
+// 新增头文件
+#include <linux/io.h>
+
+// 新增函数声明
+
+static void hc_free_dma_task_descriptor(struct virt_dma_desc *vd);
+static struct dma_chan *hc_dma_of_xlate(struct of_phandle_args *dma_spec, struct of_dma *ofdma);
+
 /*
  * DMA探测函数
  * 功能: 当平台设备被探测到时，初始化DMA控制器。
  */
 static int hc_dma_probe(struct platform_device *pdev) {
-    // 1. 从设备树中获取DMA控制器的资源信息（寄存器基地址、中断号、时钟资源等）。
-    // 2. 启用并初始化DMA控制器的时钟。
-    // 3. 申请DMA控制器的中断号，并注册中断处理程序。
-    // 4. 初始化DMA物理通道和虚拟通道的结构体，分配资源。
-    // 5. 初始化任务队列、描述符池、任务调度器等内核资源。
-    // 6. 注册DMA设备到内核DMA框架，供其他驱动使用。
-    // 7. 返回成功或者失败的状态。
+    struct resource *res;               // 资源
+    DMA_DEV_Info *dma_dev;              // DMA设备信息结构体
+    const struct of_device_id *match;   // 匹配表信息
+    int ret, i;                         // 返回结果和计数器
+
+    // 给DMA设备信息结构体分配内存
+    dma_dev = devm_kzalloc(&pdev->dev, sizeof(*dma_dev), GFP_KERNEL);
+    if (!dma_dev) {
+        // 分配失败返回
+        return -ENOMEM;
+    }
+
+    // 获取匹配表里面的配置数据（也就是物理通道数、虚拟通道数、最大请求ID）
+    match = of_match_device(hc_dma_of_match, &pdev->dev);
+    if (!match) {
+        return -EINVAL;
+    }
+    dma_dev->cfg = match->data;
+
+    // 从设备树获取资源
+    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+    // 直接从资源里面读出物理地址和映射大小，然后建立映射关系
+    dma_dev->base_addr = devm_ioremap_resource(&pdev->dev, res);
+    if (IS_ERR(dma_dev->base_addr)) {
+        return PTR_ERR(dma_dev->base_addr);
+    }
+
+    // 从设备树获取IRQ中断号
+    dma_dev->irq = platform_get_irq(pdev, 0);
+    if (dma_dev->irq < 0) {
+        dev_err(&pdev->dev, "Failed to get IRQ\n");
+        return dma_dev->irq;
+    }
+    // 向内核申请对应的IRQ中断，参数是设备、中断号、中断处理函数、设备名、设备数据
+    ret = devm_request_irq(&pdev->dev, dma_dev->irq, hc_dma_interrupt, 0, pdev->name, dma_dev);
+    if (ret) {
+        dev_err(&pdev->dev, "Failed to request IRQ\n");
+        return ret;
+    }
+
+    // 从设备中获取DMA控制器需要的时钟控制资源
+    dma_dev->clk = devm_clk_get(&pdev->dev, NULL);
+    if (IS_ERR(dma_dev->clk)) {
+        dev_err(&pdev->dev, "Failed to get clock\n");
+        return PTR_ERR(dma_dev->clk);
+    }
+
+    // 从设备中获取DMA控制器需要的复位控制资源
+    dma_dev->rstc = devm_reset_control_get(&pdev->dev, NULL);
+    if (IS_ERR(dma_dev->rstc)) {
+        dev_err(&pdev->dev, "Failed to get reset controller\n");
+        return PTR_ERR(dma_dev->rstc);
+    }
+
+    // 创建管理DMA描述符的内存池，用于管理硬件DMA控制器所需的描述符结构体DMA_HardWare_Descriptor
+    // 参数为：设备名，设备结构体，描述符大小，对齐要求（这里要求4字节），内存分配粒度（0是默认）
+    dma_dev->pool = dmam_pool_create(dev_name(&pdev->dev), &pdev->dev, sizeof(DMA_HardWare_Descriptor), 4, 0);
+    if (!dma_dev->pool) {
+        dev_err(&pdev->dev, "Failed to create DMA descriptor pool\n");
+        return -ENOMEM;
+    }
+
+    // 初始化自旋锁
+    spin_lock_init(&dma_dev->lock);
+    // 初始化当前DMA设备挂起排队的任务的双向链表头结点
+    INIT_LIST_HEAD(&dma_dev->pending);
+    // 初始化当前DMA设备具有的通道链表头结点
+    INIT_LIST_HEAD(&dma_dev->slave.channels);
+
+    // 设置该DMA设备的功能，指定支持的功能
+
+    // DMA_PRIVATE: 表示该设备只能被某些特定的设备使用，通常指的是专有的、私有的DMA通道，
+    // 这里的私有指的是不会和其他外设共享通道，这种类型的DMA不被其他设备抢占或复用，用于保证特定设备的DMA任务。
+    dma_cap_set(DMA_PRIVATE, dma_dev->slave.cap_mask);
+
+    // DMA_MEMCPY: 该DMA设备支持内存到内存的传输（Memory Copy）。这是最常见的DMA操作之一，
+    // 用于在不同内存区域之间快速移动数据。
+    dma_cap_set(DMA_MEMCPY, dma_dev->slave.cap_mask);
+
+    // DMA_SLAVE: 该设备支持从设备到内存，或者内存到设备的传输。这通常用于外设传输数据的场景，
+    // 例如从UART、I2C等外设进行数据传输时，通过DMA加速数据读写。
+    // DMA_SLAVE 是指 DMA 控制器将外设视为“主设备”，它在主设备与内存之间传输数据。
+    dma_cap_set(DMA_SLAVE, dma_dev->slave.cap_mask);
+
+    // DMA_CYCLIC: 支持循环传输模式，这种模式常用于音频、视频等实时数据流的传输，数据可以在缓冲区中
+    // 循环传输，而无需在每次传输完成后重新设置地址或重新配置DMA。
+    dma_cap_set(DMA_CYCLIC, dma_dev->slave.cap_mask);
+
+
+    // 指定该DMA设备的各个功能的函数指针（slave这个结构体成员的类型来自于Linux源代码目录下的include/linux/dmaengine.h，第712行开始）
+    dma_dev->slave.device_alloc_chan_resources = hc_dma_alloc_chan_resources;     // 分配DMA通道资源
+    dma_dev->slave.device_free_chan_resources  = hc_dma_free_chan_resources;      // 释放DMA通道资源
+    dma_dev->slave.device_prep_dma_memcpy      = hc_dma_prep_dma_memcpy;          // 准备一个内存拷贝操作
+
+    // 缺失device_prep_dma_xor，该函数用于内存数据块的异或操作（常用于 RAID 校验）。
+    // 主要用于 RAID 系统中，通过异或多个数据块生成校验数据块。
+
+    // 缺失device_prep_dma_xor_val，该函数用于检查多个数据块之间的 XOR 和验证。
+    // 用于验证多个数据块之间的异或校验结果，确保数据完整性，通常在 RAID 校验中使用。
+
+    // 缺失device_prep_dma_pq，该函数用于准备 PQ 操作，常用于高级 RAID 校验（例如 RAID-6）。
+    // PQ 操作涉及两个校验数据块，通常用于 RAID-6 级别的数据校验。
+
+    // 缺失device_prep_dma_pq_val，该函数用于验证 PQ 校验和。
+    // 用于 RAID-6 校验，验证生成的 PQ 校验数据是否正确。
+
+    // 缺失device_prep_dma_memset，该函数用于准备 DMA 内存清零操作（如 memset）。
+    // 通过 DMA 进行内存的填充操作，例如将内存块初始化为一个特定的值（如清零）。
+
+    // 缺失device_prep_dma_memset_sg，该函数用于准备 scatter-gather 形式的内存填充操作。
+    // 类似于 memset，但操作的是一个 scatter-gather 列表，用于分散的内存块进行填充。
+
+    // 缺失device_prep_dma_interrupt，该函数用于准备传输完成时触发的中断。
+    // 当 DMA 操作完成后，通过中断通知处理器，通常用于实时通知系统传输完成。
+
+    // 缺失device_prep_dma_sg，该函数用于准备散列-聚集（scatter-gather）的传输操作。
+    // 用于对分散的内存块进行传输，可以将多个不连续的内存块聚合到一起，或将数据分散到不同块中。
+
+    dma_dev->slave.device_prep_slave_sg        = hc_dma_prep_slave_sg;            // 准备一个从设备的scatter-gather传输
+    dma_dev->slave.device_prep_dma_cyclic      = hc_dma_prep_dma_cyclic;          // 准备一个循环DMA操作
+
+    // 缺失device_prep_interleaved_dma，该函数用于准备交错传输，适合复杂数据结构。
+    // 用于处理交错数据传输的场景，例如不同步的数据传输，或多个源/目的地址的复杂传输模式。
+
+    // 缺失device_prep_dma_imm_data，该函数用于准备 DMA 的立即数据传输。
+    // 将 8 字节的立即数据传输到目的地址，通常用于传输较小的数据块而不需要大型内存缓冲区。
+
+    dma_dev->slave.device_config               = hc_dma_config;                   // 配置DMA通道
+    dma_dev->slave.device_pause                = hc_dma_pause;                    // 暂停DMA传输
+    dma_dev->slave.device_resume               = hc_dma_resume;                   // 恢复暂停的DMA传输
+    dma_dev->slave.device_terminate_all        = hc_dma_terminate_all;            // 终止所有正在进行的DMA传输
+
+    // 缺失device_synchronize，该函数用于同步DMA的终止操作。
+    // 确保 DMA 通道在终止操作时所有传输任务安全结束，避免数据丢失或资源争用。
+
+    dma_dev->slave.device_tx_status            = hc_dma_tx_status;                // 获取DMA传输状态
+    dma_dev->slave.device_issue_pending        = hc_dma_issue_pending;            // 推送挂起的DMA传输任务
+
+    // 指定DMA各项属性
+
+    // 设置内存拷贝操作的对齐方式。这里指定了内存拷贝的对齐为 4 字节（即每次拷贝的数据块长度是4字节的倍数）。
+    // 这通常与硬件要求或总线宽度相关，确保传输时对齐到4字节边界。
+    dma_dev->slave.copy_align                  = DMAENGINE_ALIGN_4_BYTES;
+
+    // 指定DMA设备支持的源地址宽度。这里设置支持的宽度有：
+    // 1字节（8位）、2字节（16位）、4字节（32位）。
+    // 这些宽度决定了DMA控制器一次能处理的源数据单元大小，常用于配置与外设或内存的接口宽度。
+    dma_dev->slave.src_addr_widths             = BIT(DMA_SLAVE_BUSWIDTH_1_BYTE) |
+                                                 BIT(DMA_SLAVE_BUSWIDTH_2_BYTES) |
+                                                 BIT(DMA_SLAVE_BUSWIDTH_4_BYTES);
+
+    // 指定DMA设备支持的目标地址宽度。这里也设置了1字节、2字节和4字节的宽度支持。
+    // 这与源地址宽度类似，决定了写入到目标地址时的单元大小，可以是与内存或设备通信时的宽度。
+    dma_dev->slave.dst_addr_widths             = BIT(DMA_SLAVE_BUSWIDTH_1_BYTE) |
+                                                 BIT(DMA_SLAVE_BUSWIDTH_2_BYTES) |
+                                                 BIT(DMA_SLAVE_BUSWIDTH_4_BYTES);
+
+    // 指定DMA支持的传输方向，通常有：
+    // 1. DMA_DEV_TO_MEM: 设备到内存传输。常见于从外设（如UART、I2C）读取数据并写入到内存中。
+    // 2. DMA_MEM_TO_DEV: 内存到设备传输。常见于从内存将数据写入外设。
+    // 这里配置DMA设备支持这两种传输方向（外设到内存和内存到外设）。
+    dma_dev->slave.directions                  = BIT(DMA_DEV_TO_MEM) |
+                                                 BIT(DMA_MEM_TO_DEV);
+
+    // 设置DMA传输的剩余字节粒度。在 DMA 传输的过程中，驱动程序可能会查询剩余的未传输字节数。
+    // 这里设置粒度为DMA_RESIDUE_GRANULARITY_BURST，表示传输剩余数据的精确度是基于DMA传输的突发传输（burst），
+    // 而不是单个字节或其他更小的单位。这在高效传输大块数据时很常见。
+    dma_dev->slave.residue_granularity          = DMA_RESIDUE_GRANULARITY_BURST;
+
+    // 关联 DMA 设备与平台设备（`pdev`）的设备结构体。这是 DMA 引擎框架中的标准做法，用于
+    // 表示这个 DMA 控制器与具体的硬件设备（通过平台设备）相关联。通过 `pdev->dev`，DMA 控制器可以获取
+    // 设备相关的信息，例如设备的资源、名称、驱动程序等。
+    dma_dev->slave.dev                          = &pdev->dev;
+
+    // 给物理通道数组分配内存
+    dma_dev->pchans = devm_kcalloc(&pdev->dev, dma_dev->cfg->max_physical_channels, sizeof(DMA_Physical_Channel_Info), GFP_KERNEL);
+    if (!dma_dev->pchans) {
+        return -ENOMEM;
+    }
+    // 给虚拟通道数组分配内存
+    dma_dev->vchans = devm_kcalloc(&pdev->dev, dma_dev->cfg->max_virtual_channels, sizeof(DMA_Virtual_Channel_Info), GFP_KERNEL);
+    if (!dma_dev->vchans) {
+        return -ENOMEM;
+    }
+
+    // 初始化物理通道数组
+    for (i = 0; i < dma_dev->cfg->max_physical_channels; i++) {
+        DMA_Physical_Channel_Info *pchan = &dma_dev->pchans[i];
+        pchan->index = i;
+        pchan->base_addr = dma_dev->base_addr + DMA_EN_REG_OFFSET(i);
+
+        // 现在是初始化阶段，肯定没任务，置为NULL就对了
+        pchan->todo = NULL;
+        pchan->done = NULL;
+        pchan->vchan = NULL;
+    }
+
+    // 初始化虚拟通道数组
+    for (i = 0; i < dma_dev->cfg->max_virtual_channels; i++) {
+        DMA_Virtual_Channel_Info *vchan = &dma_dev->vchans[i];
+
+        // 同理，现在是初始化阶段，没有任何任务，做一点简单的初始化就行了
+        vchan->pchan = NULL;
+
+        vchan->port = 0;
+        vchan->irq_type = 0;
+        vchan->cyclic = false;
+        INIT_LIST_HEAD(&vchan->task_queue_head);
+        vchan->task = NULL;
+
+        // 关联描述符的free函数指针，这样内核就可以自动释放DMA描述符了，这里关联任务描述符释放函数，因为任务描述符才是DMA驱动使用，而不是硬件使用的
+        vchan->vc.desc_free = hc_free_dma_task_descriptor;
+
+        // 初始化这个虚拟通道
+        vchan_init(&vchan->vc, &dma_dev->slave);
+    }
+
+    // 初始化任务调度器，用于DMA任务调度，参数为任务结构体指针、调度函数、传给调度函数的参数
+    tasklet_init(&dma_dev->task, hc_dma_tasklet, (unsigned long)dma_dev);
+
+    // 解除DMA的复位状态
+    ret = reset_control_deassert(dma_dev->rstc);
+    if (ret) {
+        dev_err(&pdev->dev, "Couldn't deassert the device from reset\n");
+        goto cleanup_dma_tasklet;
+    }
+
+    // 准备和启用之前申请的给DMA控制器的时钟
+    ret = clk_prepare_enable(dma_dev->clk);
+    if (ret) {
+        dev_err(&pdev->dev, "Couldn't enable the clock\n");
+        goto cleanup_dma_reset;
+    }
+
+    // 将DMA控制器注册到DMA引擎框架中
+    ret = dma_async_device_register(&dma_dev->slave);
+    if (ret) {
+        dev_warn(&pdev->dev, "Failed to register DMA engine device\n");
+        goto cleanup_dma_clock;
+    }
+
+    // 向设备树注册 DMA 控制器，允许其他设备通过设备树中的 dma 属性与该控制器通信
+    ret = of_dma_controller_register(pdev->dev.of_node, hc_dma_of_xlate, dma_dev);
+    if (ret) {
+        dev_err(&pdev->dev, "of_dma_controller_register failed\n");
+        goto cleanup_dma_engine_registration;
+    }
+
+    // 保存设备数据，以便其他代码通过pdev获取dma_dev。
+    platform_set_drvdata(pdev, dma_dev);
+
+    return 0;
+
+    // 和上面的逻辑关系类似于栈，这样就能保证所有的操作都能成功回滚
+cleanup_dma_engine_registration:
+    dma_async_device_unregister(&dma_dev->slave);   // dma_async_device_register的反操作
+cleanup_dma_clock:
+    clk_disable_unprepare(dma_dev->clk);            // clk_prepare_enable的反操作
+cleanup_dma_reset:
+    reset_control_assert(dma_dev->rstc);            // reset_control_deassert的反操作
+cleanup_dma_tasklet:
+    // 这里就是清理之前的所有资源了
+    // 内核不能自动回收的，就要在这里清理
+
+    // 首先要禁用该DMA控制器的两组中断使能寄存器，防止它再打中断
+    iowrite32(0, dma_dev->base_addr + DMA_IRQ_EN_REG0_OFFSET);
+    iowrite32(0, dma_dev->base_addr + DMA_IRQ_EN_REG1_OFFSET);
+
+    // 变更tasklet的运行状态为关闭
+    atomic_inc(&dma_dev->tasklet_shutdown);
+
+    // 清理虚拟通道的资源
+    for (i = 0; i < dma_dev->cfg->max_virtual_channels; i++) {
+        DMA_Virtual_Channel_Info *vchan = &dma_dev->vchans[i];
+
+        // 删掉虚拟通道的设备链表结点
+        list_del(&vchan->vc.chan.device_node);
+
+        // 杀掉这个虚拟通道的tasklet，完成销毁
+        tasklet_kill(&vchan->vc.task);
+    }
+
+    // 杀死该控制器的tasklet，完成所有的tasklet的销毁
+    tasklet_kill(&dma_dev->task);
+
+    // 释放申请的IRQ中断，是devm_request_irq的反操作
+    devm_free_irq(dma_dev->slave.dev, dma_dev->irq, dma_dev);
+
+    return ret;
 }
 
 /*
@@ -510,12 +800,36 @@ static int hc_dma_probe(struct platform_device *pdev) {
  * 功能: 当平台设备被移除时，释放资源并进行清理。
  */
 static int hc_dma_remove(struct platform_device *pdev) {
-    // 1. 停止所有进行中的DMA操作，确保DMA任务全部结束。
-    // 2. 释放DMA中断资源，注销中断处理程序。
-    // 3. 释放DMA时钟资源，停用时钟。
-    // 4. 释放物理通道和虚拟通道占用的资源。
-    // 5. 清理DMA控制器的任务队列、描述符池等内核资源。
-    // 6. 返回成功或者失败的状态。
+    DMA_DEV_Info *dma_dev = platform_get_drvdata(pdev);
+    int i;
+
+    // 首先要禁用该DMA控制器的两组中断使能寄存器，防止它再打中断
+    iowrite32(0, dma_dev->base_addr + DMA_IRQ_EN_REG0_OFFSET);
+    iowrite32(0, dma_dev->base_addr + DMA_IRQ_EN_REG1_OFFSET);
+
+    // 变更tasklet的运行状态为关闭
+    atomic_inc(&dma_dev->tasklet_shutdown);
+
+    // 清理虚拟通道的资源
+    for (i = 0; i < dma_dev->cfg->max_virtual_channels; i++) {
+        DMA_Virtual_Channel_Info *vchan = &dma_dev->vchans[i];
+
+        // 删掉虚拟通道的设备链表结点
+        list_del(&vchan->vc.chan.device_node);
+
+        // 杀掉这个虚拟通道的tasklet，完成销毁
+        tasklet_kill(&vchan->vc.task);
+    }
+
+    // 杀死该控制器的tasklet，完成所有的tasklet的销毁
+    tasklet_kill(&dma_dev->task);
+
+    dma_async_device_unregister(&dma_dev->slave);   // dma_async_device_register的反操作
+    clk_disable_unprepare(dma_dev->clk);            // clk_prepare_enable的反操作
+    reset_control_assert(dma_dev->rstc);            // reset_control_deassert的反操作
+
+    // 释放申请的IRQ中断，是devm_request_irq的反操作
+    devm_free_irq(dma_dev->slave.dev, dma_dev->irq, dma_dev);
 }
 
 /*
@@ -523,11 +837,7 @@ static int hc_dma_remove(struct platform_device *pdev) {
  * 功能: 使用tasklet机制处理DMA操作中的任务调度和管理。
  */
 static void hc_dma_tasklet(unsigned long data) {
-    // 1. 获取tasklet相关的DMA控制器结构体信息。
-    // 2. 遍历任务队列，检查是否有待处理的DMA任务。
-    // 3. 根据DMA任务描述符，配置DMA控制器寄存器。
-    // 4. 启动DMA传输。
-    // 5. 完成当前任务后，检查是否有下一个任务，若有则继续调度。
+    // 暂时不执行任何操作
 }
 
 /*
@@ -535,10 +845,7 @@ static void hc_dma_tasklet(unsigned long data) {
  * 功能: 处理DMA控制器产生的中断。
  */
 static irqreturn_t hc_dma_interrupt(int irq, void *dev_id) {
-    // 1. 检查DMA控制器的中断状态寄存器，确认触发的中断类型。
-    // 2. 对于DMA传输完成或错误中断，清除中断标志。
-    // 3. 如果是传输完成中断，唤醒tasklet处理下一个任务。
-    // 4. 返回中断处理的状态（IRQ_HANDLED 或者 IRQ_NONE）。
+    return IRQ_NONE;  // 没有处理中断
 }
 
 /*
@@ -547,31 +854,19 @@ static irqreturn_t hc_dma_interrupt(int irq, void *dev_id) {
  */
 static struct dma_async_tx_descriptor *hc_dma_prep_dma_memcpy(
         struct dma_chan *chan, dma_addr_t dest, dma_addr_t src, size_t len, unsigned long flags) {
-    // 1. 检查传入的源地址和目的地址是否合法。
-    // 2. 在描述符池中分配一个新的DMA描述符。
-    // 3. 设置DMA描述符的源地址、目的地址、传输长度等字段。
-    // 4. 将描述符加入DMA任务队列。
-    // 5. 返回准备好的DMA事务描述符。
+    return NULL;  // 暂时不支持此操作
 }
 
 static struct dma_async_tx_descriptor *hc_dma_prep_slave_sg(
         struct dma_chan *chan, struct scatterlist *sgl, unsigned int sg_len,
         enum dma_transfer_direction dir, unsigned long flags, void *context) {
-    // 1. 遍历scatter-gather列表，检查每个段的地址和长度是否合法。
-    // 2. 分配并设置对应的DMA描述符，填入scatter-gather的地址和长度信息。
-    // 3. 根据DMA传输方向（内存到设备或设备到内存），设置描述符的源和目的地址。
-    // 4. 将所有描述符链接在一起，形成描述符链。
-    // 5. 将描述符链加入DMA任务队列，并返回事务描述符。
+    return NULL;  // 暂时不支持此操作
 }
 
 static struct dma_async_tx_descriptor *hc_dma_prep_dma_cyclic(
         struct dma_chan *chan, dma_addr_t buf_addr, size_t buf_len, size_t period_len,
         enum dma_transfer_direction dir, unsigned long flags) {
-    // 1. 检查传入的缓冲区地址和长度是否合法。
-    // 2. 为周期性DMA操作分配多个描述符，每个描述符处理一个周期长度的数据。
-    // 3. 将描述符链接成环状，形成循环DMA操作。
-    // 4. 设置DMA传输方向（内存到设备或设备到内存），配置描述符中的地址。
-    // 5. 将描述符链加入任务队列，并返回事务描述符。
+    return NULL;  // 暂时不支持此操作
 }
 
 /*
@@ -579,11 +874,7 @@ static struct dma_async_tx_descriptor *hc_dma_prep_dma_cyclic(
  * 功能: 配置DMA通道的相关设置（地址宽度、突发长度等）。
  */
 static int hc_dma_config(struct dma_chan *chan, struct dma_slave_config *config) {
-    // 1. 检查传入的配置参数是否合法。
-    // 2. 配置DMA通道的源地址宽度、目的地址宽度、突发长度等参数。
-    // 3. 更新DMA通道配置寄存器。
-    // 4. 将新的配置应用到对应的DMA通道。
-    // 5. 返回配置结果（成功或失败）。
+    return 0;  // 返回成功
 }
 
 /*
@@ -591,24 +882,15 @@ static int hc_dma_config(struct dma_chan *chan, struct dma_slave_config *config)
  * 功能: 控制DMA通道的暂停、恢复和终止操作。
  */
 static int hc_dma_pause(struct dma_chan *chan) {
-    // 1. 获取DMA通道的状态，检查是否正在传输数据。
-    // 2. 如果通道正在传输，暂停DMA控制器对该通道的访问。
-    // 3. 更新通道状态为暂停。
-    // 4. 返回暂停操作的结果（成功或失败）。
+    return 0;  // 返回成功
 }
 
 static int hc_dma_resume(struct dma_chan *chan) {
-    // 1. 检查DMA通道当前是否处于暂停状态。
-    // 2. 如果通道处于暂停状态，恢复DMA控制器对该通道的访问。
-    // 3. 继续未完成的DMA传输操作。
-    // 4. 返回恢复操作的结果（成功或失败）。
+    return 0;  // 返回成功
 }
 
 static int hc_dma_terminate_all(struct dma_chan *chan) {
-    // 1. 停止DMA控制器对该通道的所有访问，清除挂起的任务。
-    // 2. 释放通道上的所有DMA描述符和任务资源。
-    // 3. 将通道状态更新为终止状态。
-    // 4. 返回终止操作的结果（成功或失败）。
+    return 0;  // 返回成功
 }
 
 /*
@@ -617,10 +899,7 @@ static int hc_dma_terminate_all(struct dma_chan *chan) {
  */
 static enum dma_status hc_dma_tx_status(
         struct dma_chan *chan, dma_cookie_t cookie, struct dma_tx_state *state) {
-    // 1. 检查DMA传输任务的cookie，判断该任务是否仍在进行中。
-    // 2. 如果任务已经完成，更新传输状态为DMA_COMPLETE。
-    // 3. 如果任务尚未完成，检查传输进度，更新state结构体。
-    // 4. 返回当前传输任务的状态（例如：DMA_IN_PROGRESS、DMA_ERROR、DMA_COMPLETE）。
+    return DMA_COMPLETE;  // 假设传输已完成
 }
 
 /*
@@ -628,10 +907,7 @@ static enum dma_status hc_dma_tx_status(
  * 功能: 提交待处理的DMA事务。
  */
 static void hc_dma_issue_pending(struct dma_chan *chan) {
-    // 1. 检查DMA任务队列是否有待处理的任务。
-    // 2. 将任务队列中的描述符提交给DMA控制器。
-    // 3. 如果DMA控制器空闲，立即启动传输。
-    // 4. 如果DMA控制器忙碌，等待当前任务完成后处理下一个任务。
+    // 暂时不处理
 }
 
 /*
@@ -639,10 +915,7 @@ static void hc_dma_issue_pending(struct dma_chan *chan) {
  * 功能: 为每个虚拟或物理DMA通道分配资源。
  */
 static int hc_dma_alloc_chan_resources(struct dma_chan *chan) {
-    // 1. 分配通道相关的资源，包括描述符池、任务队列等。
-    // 2. 初始化通道的控制结构体和相关寄存器。
-    // 3. 将通道注册到内核DMA框架中。
-    // 4. 返回资源分配的结果（成功或失败）。
+    return 0;  // 成功分配资源
 }
 
 /*
@@ -650,10 +923,7 @@ static int hc_dma_alloc_chan_resources(struct dma_chan *chan) {
  * 功能: 释放与DMA通道相关的资源。
  */
 static void hc_dma_free_chan_resources(struct dma_chan *chan) {
-    // 1. 停止该通道上的所有DMA任务。
-    // 2. 释放描述符池和任务队列中的资源。
-    // 3. 更新通道状态为未使用。
-    // 4. 将通道从内核DMA框架中注销。
+    // 暂时不释放任何资源
 }
 
 /*
@@ -661,10 +931,7 @@ static void hc_dma_free_chan_resources(struct dma_chan *chan) {
  * 功能: 启动DMA传输操作。
  */
 static int hc_dma_start_transfer(struct dma_chan *chan) {
-    // 1. 检查通道是否有待处理的DMA任务。
-    // 2. 配置DMA控制器的寄存器，开始执行传输。
-    // 3. 启动DMA控制器对该通道的访问。
-    // 4. 返回传输启动的结果（成功或失败）。
+    return 0;  // 成功启动
 }
 
 /*
@@ -672,9 +939,69 @@ static int hc_dma_start_transfer(struct dma_chan *chan) {
  * 功能: 停止DMA传输操作。
  */
 static void hc_dma_stop_transfer(struct dma_chan *chan) {
-    // 1. 停止DMA控制器对该通道的访问，终止传输。
-    // 2. 清除通道上的传输状态，释放相关资源。
-    // 3. 将通道状态更新为停止。
+    // 暂时不处理
+}
+
+// 新增函数的实现
+
+// DMA任务描述符释放函数
+static void hc_free_dma_task_descriptor(struct virt_dma_desc *vd) {
+    // 因为DMA_TASK_Descriptor中，我把vd放在第一个，所以不用container_of的宏，也可以直接强转类型
+    // 类似的还有DMA_DEV_Info，DMA_Virtual_Channel_Info
+
+    // vd转描述符指针
+    DMA_TASK_Descriptor *task_descriptor = (DMA_TASK_Descriptor *)vd;
+    // 转DMA_DEV_Info指针
+    DMA_DEV_Info *dma_dev = (DMA_DEV_Info *)(vd->tx.chan->device);
+
+    // 硬件DMA的描述符指针（软件用的指针）
+    DMA_HardWare_Descriptor *v_cur = task_descriptor->virtual_addr;
+    DMA_HardWare_Descriptor *v_next;
+    // 硬件用的指针
+    dma_addr_t p_cur = task_descriptor->physical_addr;
+    dma_addr_t p_next;
+
+    // 这个函数是清空任务描述符，把任务描述符的链表上挂着的所有DMA硬件描述符全部释放，不是单独释放一个。
+    // 所以要循环，释放掉所有DMA硬件描述符
+    while(v_cur) {
+        v_next = v_cur->v_next_dma_descriptor;
+        p_next = v_cur->p_next_dma_descriptor;
+
+        // 释放这条链上硬件描述符使用的内存
+        dma_pool_free(dma_dev->pool, v_cur, p_cur);
+
+        // 切换指针
+        v_cur = v_next;
+        p_cur = p_next;
+    }
+
+    // 释放掉当前驱动用的任务描述符的内存
+    kfree(task_descriptor);
+}
+
+// 该函数从设备树中解析 DMA 请求并返回一个可用的 DMA 通道，同时将通道与指定的端口号关联。
+static struct dma_chan *hc_dma_of_xlate(struct of_phandle_args *dma_spec, struct of_dma *ofdma) {
+    DMA_DEV_Info *dma_dev = ofdma->of_dma_data;
+    struct dma_chan *chan;
+
+    // dma_spec->args[0]存储的是设备树中指定的DMA请求端口
+    uint32_t port = dma_spec->args[0];
+
+    // 判断端口是否越界
+    if (port > dma_dev->cfg->max_requests) {
+        return NULL;
+    }
+
+    // 获取任意一个可用的DMA通道
+    chan = dma_get_any_slave_channel(&dma_dev->slave);
+    if (!chan) {
+        return NULL;
+    }
+
+    // 虚拟通道对应到该设备的端口，并写入结构体成员中
+    ((DMA_Virtual_Channel_Info *)chan)->port = port;
+
+    return chan;
 }
 
 // 以下是驱动作者信息和描述、版本、许可证信息
