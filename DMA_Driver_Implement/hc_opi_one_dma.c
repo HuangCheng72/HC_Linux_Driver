@@ -955,15 +955,22 @@ static irqreturn_t hc_dma_interrupt(int irq, void *dev_id) {
                 // 只要允许的中断类型出现就行，没必要完全符合
                 // 所以把值右移，再位与irq_type，只要不为0，说明有符合的
                 if( (reg_value >> (i * 4)) & vchan->irq_type ) {
-                    // 这个版本暂时不支持循环DMA，所以不考虑这个情况
-                    // 操作通道，自然要上通道锁保护
-                    spin_lock(&vchan->vc.lock);
-                    // 更新任务状态
-                    vchan_cookie_complete(&pchan->todo->vd);
-                    // 更新任务指针
-                    pchan->done = pchan->todo;
-                    pchan->todo = NULL;
-                    spin_unlock(&vchan->vc.lock);
+                    // 要判断是否属于循环DMA
+                    if(vchan->cyclic) {
+                        // 属于循环DMA就要让内核的DMA框架处理了
+                        vchan_cyclic_callback(&pchan->todo->vd);
+                    } else {
+                        // 不属于循环DMA，就需要手动更新任务的状态
+
+                        // 操作通道，自然要上通道锁保护
+                        spin_lock(&vchan->vc.lock);
+                        // 更新任务状态
+                        vchan_cookie_complete(&pchan->todo->vd);
+                        // 更新任务指针
+                        pchan->done = pchan->todo;
+                        pchan->todo = NULL;
+                        spin_unlock(&vchan->vc.lock);
+                    }
                 }
             }
         }
