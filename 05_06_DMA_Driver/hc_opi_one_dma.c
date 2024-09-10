@@ -123,16 +123,16 @@
 #define DMA_STA_REG_OFFSET          0x30    // DMA 状态寄存器
 
 // DMA 通道专用寄存器 (N=0到11)
-#define DMA_EN_REG_OFFSET(N)        (0x100 * (N) + 0x40 * 0x00)     // DMA 通道使能寄存器 (N=0到11)
-#define DMA_PAU_REG_OFFSET(N)       (0x100 * (N) + 0x40 * 0x04)     // DMA 通道暂停寄存器 (N=0到11)
-#define DMA_DESC_ADDR_REG_OFFSET(N) (0x100 * (N) + 0x40 * 0x08)     // DMA 通道开始地址寄存器 (N=0到11)
-#define DMA_CFG_REG_OFFSET(N)       (0x100 * (N) + 0x40 * 0x0C)     // DMA 通道配置寄存器 (N=0到11)
-#define DMA_CUR_SRC_REG_OFFSET(N)   (0x100 * (N) + 0x40 * 0x10)     // DMA 通道当前源地址寄存器 (N=0到11)
-#define DMA_CUR_DEST_REG_OFFSET(N)  (0x100 * (N) + 0x40 * 0x14)     // DMA 通道当前目标地址寄存器 (N=0到11)
-#define DMA_BCNT_LEFT_REG_OFFSET(N) (0x100 * (N) + 0x40 * 0x18)     // DMA 通道剩余字节计数器寄存器 (N=0到11)
-#define DMA_PARA_REG_OFFSET(N)      (0x100 * (N) + 0x40 * 0x1C)     // DMA 通道参数寄存器 (N=0到11)
-#define DMA_FDESC_ADDR_REG_OFFSET(N)(0x100 * (N) + 0x40 * 0x2C)     // DMA 前描述符地址寄存器 (N=0到11)
-#define DMA_PKG_NUM_REG_OFFSET(N)   (0x100 * (N) + 0x40 * 0x30)     // DMA 数据包编号寄存器 (N=0到11)
+#define DMA_EN_REG_OFFSET(N)        (0x100 + 0x40 * (N) + 0x00)     // DMA 通道使能寄存器 (N=0到11)
+#define DMA_PAU_REG_OFFSET(N)       (0x100 + 0x40 * (N) + 0x04)     // DMA 通道暂停寄存器 (N=0到11)
+#define DMA_DESC_ADDR_REG_OFFSET(N) (0x100 + 0x40 * (N) + 0x08)     // DMA 通道开始地址寄存器 (N=0到11)
+#define DMA_CFG_REG_OFFSET(N)       (0x100 + 0x40 * (N) + 0x0C)     // DMA 通道配置寄存器 (N=0到11)
+#define DMA_CUR_SRC_REG_OFFSET(N)   (0x100 + 0x40 * (N) + 0x10)     // DMA 通道当前源地址寄存器 (N=0到11)
+#define DMA_CUR_DEST_REG_OFFSET(N)  (0x100 + 0x40 * (N) + 0x14)     // DMA 通道当前目标地址寄存器 (N=0到11)
+#define DMA_BCNT_LEFT_REG_OFFSET(N) (0x100 + 0x40 * (N) + 0x18)     // DMA 通道剩余字节计数器寄存器 (N=0到11)
+#define DMA_PARA_REG_OFFSET(N)      (0x100 + 0x40 * (N) + 0x1C)     // DMA 通道参数寄存器 (N=0到11)
+#define DMA_FDESC_ADDR_REG_OFFSET(N)(0x100 + 0x40 * (N) + 0x2C)     // DMA 前描述符地址寄存器 (N=0到11)
+#define DMA_PKG_NUM_REG_OFFSET(N)   (0x100 + 0x40 * (N) + 0x30)     // DMA 数据包编号寄存器 (N=0到11)
 
 // DMA_IRQ_EN_REG0 位域结构体定义，来自技术手册p193 4.11.4.1 DMA IRQ Enable Register0
 typedef struct {
@@ -382,7 +382,7 @@ typedef struct hc_sun6i_dma_descriptor {
 // 驱动使用的DMA任务描述符，实际上就是简单包装一下DMA_HardWare_Descriptor，获取相关信息的时候方便一些，并继承Linux内核DMA驱动框架的虚拟通道描述符
 typedef struct hc_dma_task_descriptor {
     struct virt_dma_desc    vd;             // Linux内核的虚拟DMA框架的DMA任务描述符，继承这个，就可以让Linux内核自动管理这个描述符
-    dma_addr_t * physical_addr;             // 描述符的物理地址
+    dma_addr_t physical_addr;               // 描述符的物理地址
     DMA_HardWare_Descriptor * virtual_addr; // 描述符的虚拟地址
 } DMA_TASK_Descriptor;
 
@@ -406,12 +406,12 @@ struct hc_sun6i_dma_virtual_channel_info {
     DMA_Physical_Channel_Info * pchan;  // 当前绑定的物理通道（如果当前无任务应为NULL）
 
     struct dma_slave_config cfg;        // 该虚拟通道的从设备配置
-    uint32_t			    port;       // 该虚拟通道对应的DRQ端口
-    uint32_t			    irq_type;   // 中断类型
-    bool			        cyclic;     // 该虚拟通道是否为循环DMA模式
+    uint32_t                port;       // 该虚拟通道对应的DRQ端口
+    uint32_t                irq_type;   // 中断类型
+    bool                    cyclic;     // 该虚拟通道是否为循环DMA模式
 
-    struct list_head        task_queue_head;    // 该虚拟通道的任务队列
-    DMA_TASK_Descriptor *   task;               // 该虚拟通道当前正在处理的任务
+    struct list_head        pending_node;    // 该虚拟通道的任务等待结点，用于挂到DMA_DEV_Info的pending上
+    bool                    need_start;      // 该虚拟通道是否需要启动传输的标志
 };
 
 // 该结构体记录适配型号的不同DMA的各项参数
@@ -458,8 +458,8 @@ static enum dma_status hc_dma_tx_status(struct dma_chan *chan, dma_cookie_t cook
 static void hc_dma_issue_pending(struct dma_chan *chan);
 static int hc_dma_alloc_chan_resources(struct dma_chan *chan);
 static void hc_dma_free_chan_resources(struct dma_chan *chan);
-static int hc_dma_start_transfer(struct dma_chan *chan);
-static void hc_dma_stop_transfer(struct dma_chan *chan);
+static int hc_dma_start_transfer(DMA_DEV_Info *dma_dev, DMA_Virtual_Channel_Info *vchan);
+static void hc_dma_stop_transfer(DMA_DEV_Info *dma_dev, DMA_Virtual_Channel_Info *vchan);
 
 // 以下是平台驱动匹配信息
 
@@ -711,8 +711,8 @@ static int hc_dma_probe(struct platform_device *pdev) {
         vchan->port = 0;
         vchan->irq_type = 0;
         vchan->cyclic = false;
-        INIT_LIST_HEAD(&vchan->task_queue_head);
-        vchan->task = NULL;
+        INIT_LIST_HEAD(&vchan->pending_node);
+        vchan->need_start = false;
 
         // 关联描述符的free函数指针，这样内核就可以自动释放DMA描述符了，这里关联任务描述符释放函数，因为任务描述符才是DMA驱动使用，而不是硬件使用的
         vchan->vc.desc_free = hc_free_dma_task_descriptor;
@@ -830,6 +830,7 @@ static int hc_dma_remove(struct platform_device *pdev) {
 
     // 释放申请的IRQ中断，是devm_request_irq的反操作
     devm_free_irq(dma_dev->slave.dev, dma_dev->irq, dma_dev);
+    return 0;
 }
 
 /*
@@ -930,7 +931,7 @@ static void hc_dma_free_chan_resources(struct dma_chan *chan) {
  * DMA传输启动函数
  * 功能: 启动DMA传输操作。
  */
-static int hc_dma_start_transfer(struct dma_chan *chan) {
+static int hc_dma_start_transfer(DMA_DEV_Info *dma_dev, DMA_Virtual_Channel_Info *vchan) {
     return 0;  // 成功启动
 }
 
@@ -938,7 +939,7 @@ static int hc_dma_start_transfer(struct dma_chan *chan) {
  * DMA传输停止函数
  * 功能: 停止DMA传输操作。
  */
-static void hc_dma_stop_transfer(struct dma_chan *chan) {
+static void hc_dma_stop_transfer(DMA_DEV_Info *dma_dev, DMA_Virtual_Channel_Info *vchan) {
     // 暂时不处理
 }
 
