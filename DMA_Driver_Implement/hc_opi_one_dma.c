@@ -758,13 +758,13 @@ static int hc_dma_probe(struct platform_device *pdev) {
     return 0;
 
     // 和上面的逻辑关系类似于栈，这样就能保证所有的操作都能成功回滚
-    cleanup_dma_engine_registration:
+cleanup_dma_engine_registration:
     dma_async_device_unregister(&dma_dev->slave);   // dma_async_device_register的反操作
-    cleanup_dma_clock:
+cleanup_dma_clock:
     clk_disable_unprepare(dma_dev->clk);            // clk_prepare_enable的反操作
-    cleanup_dma_reset:
+cleanup_dma_reset:
     reset_control_assert(dma_dev->rstc);            // reset_control_deassert的反操作
-    cleanup_dma_tasklet:
+cleanup_dma_tasklet:
     // 这里就是清理之前的所有资源了
     // 内核不能自动回收的，就要在这里清理
 
@@ -1103,14 +1103,154 @@ static int hc_dma_config(struct dma_chan *chan, struct dma_slave_config *config)
  * 功能: 控制DMA通道的暂停、恢复和终止操作。
  */
 static int hc_dma_pause(struct dma_chan *chan) {
+    // 需要明确的是：
+    // 1. 操作的通道对象实际上是虚拟通道
+    // 2. 既然是虚拟通道，那就要分是否有物理通道（正在进行传输）和没有物理通道（等待进行传输）的情况
+    // 3. 有物理通道，那自然就要写物理通道寄存器（既然是暂停，任务还是要继续的，所以不能解绑物理通道和虚拟通道，不缺这点资源）
+    // 4. 没有物理通道，那就直接把该通道从等待队列里面删掉，不需要再分配物理通道了
+    // 对于4.这种情况来说，考虑到tasklet中，分配物理通道的判断条件是!list_empty(&dma_dev->pending)，是从dma_dev->pending里面取对应的有任务的物理通道
+    // 所以直接把这个结点从大链表中删掉就行了
+
+    // 获取设备信息和通道的指针
+    DMA_DEV_Info *dma_dev = (DMA_DEV_Info *)(chan->device);
+    DMA_Virtual_Channel_Info *vchan = (DMA_Virtual_Channel_Info *)chan;
+    DMA_Physical_Channel_Info *pchan = vchan->pchan;
+    uint32_t reg_value;
+    // 这样就可以用结构体直接写寄存器值的特定位了
+    DMA_PAU_REG_t *dmaPauReg = (DMA_PAU_REG_t *)(&reg_value);
+
+    if(pchan) {
+        // 读对应的物理通道寄存器
+        reg_value = ioread32(dma_dev->base_addr + DMA_PAU_REG_OFFSET(pchan->index));
+        // 修改暂停位，暂停传输
+        dmaPauReg->DMA_PAUSE = 1;
+        // 写回寄存器
+        iowrite32(reg_value, dma_dev->base_addr + DMA_PAU_REG_OFFSET(pchan->index));
+
+    } else {
+        // 操作的是大链表，自然要用设备锁保护
+        spin_lock(&dma_dev->lock);
+        // 直接把这个通道的结点从大链表中删掉就行了
+        list_del_init(&vchan->pending_node);
+
+        spin_unlock(&dma_dev->lock);
+    }
+
     return 0;  // 返回成功
 }
 
 static int hc_dma_resume(struct dma_chan *chan) {
+    // hc_dma_pause的反操作，反过来就行了
+
+    // 获取设备信息和通道的指针
+    DMA_DEV_Info *dma_dev = (DMA_DEV_Info *)(chan->device);
+    DMA_Virtual_Channel_Info *vchan = (DMA_Virtual_Channel_Info *)chan;
+    DMA_Physical_Channel_Info *pchan = vchan->pchan;
+    uint32_t reg_value;
+    // 这样就可以用结构体直接写寄存器值的特定位了
+    DMA_PAU_REG_t *dmaPauReg = (DMA_PAU_REG_t *)(&reg_value);
+
+    if(pchan) {
+        // 读对应的物理通道寄存器
+        reg_value = ioread32(dma_dev->base_addr + DMA_PAU_REG_OFFSET(pchan->index));
+        // 修改暂停位，恢复传输
+        dmaPauReg->DMA_PAUSE = 0;
+        // 写回寄存器
+        iowrite32(reg_value, dma_dev->base_addr + DMA_PAU_REG_OFFSET(pchan->index));
+
+    } else {
+        // 操作的是大链表，自然要用设备锁保护
+        spin_lock(&dma_dev->lock);
+        // 直接把这个通道的结点加回到大链表中就行了
+        list_add_tail(&vchan->pending_node, &dma_dev->pending);
+
+        spin_unlock(&dma_dev->lock);
+    }
+
     return 0;  // 返回成功
 }
 
 static int hc_dma_terminate_all(struct dma_chan *chan) {
+
+    // 获取设备信息和通道的指针
+    DMA_DEV_Info *dma_dev = (DMA_DEV_Info *)(chan->device);
+    DMA_Virtual_Channel_Info *vchan = (DMA_Virtual_Channel_Info *)chan;
+    DMA_Physical_Channel_Info *pchan = vchan->pchan;
+    // 要直接操作虚拟通道信息，用到spin_lock_irqsave，因此需要保存上下文的变量
+    unsigned long flags;
+
+    uint32_t reg_value;
+    // 这样就可以用结构体直接写寄存器值的特定位了
+    DMA_EN_REG_t *dmaEnReg = (DMA_EN_REG_t *)(&reg_value);
+    DMA_PAU_REG_t *dmaPauReg = (DMA_PAU_REG_t *)(&reg_value);
+
+    // 创建一个头结点，用于获取虚拟通道的任务描述符链表，并将其销毁
+    LIST_HEAD(desc_head);
+
+    if(pchan) {
+
+        // 要变更虚拟通道资源，所以需要通道锁保护
+        spin_lock_irqsave(&vchan->vc.lock, flags);
+
+        // 如果物理通道已经绑定，写寄存器以终止传输
+        // 首先恢复传输（如果先前是暂停状态，恢复传输才可以真正停止），然后禁用通道传输功能
+        // 如此才能真正停止传输
+
+        // 该通道恢复传输
+        reg_value = ioread32(dma_dev->base_addr + DMA_PAU_REG_OFFSET(pchan->index));
+        dmaPauReg->DMA_PAUSE = 0;
+        iowrite32(reg_value, dma_dev->base_addr + DMA_PAU_REG_OFFSET(pchan->index));
+
+        // 禁用物理通道（hc_dma_start_transfer中会启用，所以不用担心）
+        reg_value = ioread32(dma_dev->base_addr + DMA_EN_REG_OFFSET(pchan->index));
+        dmaEnReg->DMA_EN = 0;
+        iowrite32(reg_value, dma_dev->base_addr + DMA_EN_REG_OFFSET(pchan->index));
+
+        // 对于循环DMA通道，需要特殊处理
+        if (vchan->cyclic) {
+            // 循环的属性去掉
+            vchan->cyclic = false;
+
+            // 将已完成的任务加入到虚拟通道的已完成描述符链表中
+            // 这是因为循环DMA不会自动完成传输（这是其特性）
+            // 必须手动标记已完成的任务，以便框架正确处理和释放资源
+            if(pchan->todo) {
+                list_add_tail(&(pchan->todo->vd.node), &(vchan->vc.desc_completed));
+            }
+        }
+
+        // 清理物理通道资源
+        pchan->todo = NULL;
+        pchan->done = NULL;
+        // 解绑物理通道和虚拟通道
+        pchan->vchan = NULL;
+        vchan->pchan = NULL;
+
+        spin_unlock_irqrestore(&vchan->vc.lock, flags);
+
+    } else {
+        // 没任务可传输，直接从大链表中删掉
+        spin_lock(&dma_dev->lock);
+        list_del_init(&vchan->pending_node);
+        spin_unlock(&dma_dev->lock);
+    }
+
+    // 然后回收任务描述符
+
+    // 属于虚拟通道的资源，需要通道锁保护
+    spin_lock_irqsave(&vchan->vc.lock, flags);
+
+    // 把所有的描述符转移到新链表头结点上（Linux内核虚拟通道支持框架提供的函数）
+    vchan_get_all_descriptors(&vchan->vc, &desc_head);
+
+
+    spin_unlock_irqrestore(&vchan->vc.lock, flags);
+
+    // 不属于虚拟通道之后，就可以不用通道锁保护了
+
+    // 让虚拟DMA通道框架释放描述符链表上的所有描述符
+    vchan_dma_desc_free_list(&vchan->vc, &desc_head);
+
     return 0;  // 返回成功
 }
 
