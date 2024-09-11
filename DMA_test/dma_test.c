@@ -41,12 +41,11 @@ static int dma_test(enum dma_transfer_direction direction)
     struct dma_async_tx_descriptor *tx;
     dma_cap_mask_t mask;
     struct dma_slave_config slave_config;
-    struct scatterlist sg;
     enum dma_ctrl_flags flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT;
     int ret;
     dma_addr_t device_phys_addr;
 
-    pr_info("DMA test started\n");
+    pr_info("Cyclic DMA test started\n");
 
     // Step 1: 设置DMA引擎能力掩码
     dma_cap_zero(mask);
@@ -98,9 +97,7 @@ static int dma_test(enum dma_transfer_direction direction)
         goto err_free_buf;
     }
 
-    // Step 5: 准备scatter-gather列表
-    sg_init_one(&sg, src_buf, DMA_BUFFER_SIZE);
-
+    // Step 5: 设置DMA循环传输
     dma_src = dma_map_single(dma_dev->dev, src_buf, DMA_BUFFER_SIZE, DMA_TO_DEVICE);
     if (dma_mapping_error(dma_dev->dev, dma_src)) {
         pr_err("DMA mapping error\n");
@@ -108,13 +105,10 @@ static int dma_test(enum dma_transfer_direction direction)
         goto err_free_buf;
     }
 
-    sg_dma_address(&sg) = dma_src;
-    sg_dma_len(&sg) = DMA_BUFFER_SIZE;
-
-    // Step 6: 准备DMA传输
-    tx = dmaengine_prep_slave_sg(dma_chan, &sg, 1, direction, flags);
+    // Step 6: 准备循环DMA传输
+    tx = dmaengine_prep_dma_cyclic(dma_chan, dma_src, DMA_BUFFER_SIZE, DMA_BUFFER_SIZE / 2, direction, flags);
     if (!tx) {
-        pr_err("Failed to prepare DMA transfer\n");
+        pr_err("Failed to prepare cyclic DMA transfer\n");
         ret = -EIO;
         goto err_free_buf;
     }
@@ -131,7 +125,7 @@ static int dma_test(enum dma_transfer_direction direction)
     // Step 9: 等待DMA传输完成
     wait_for_completion(&dma_complete);
 
-    pr_info("DMA transfer completed\n");
+    pr_info("Cyclic DMA transfer completed\n");
 
     // Step 10: 数据传输后的完整性校验
     if (direction == DMA_MEM_TO_DEV) {
@@ -154,13 +148,13 @@ err_free_buf:
 
 static int __init dma_test_init(void)
 {
-    pr_info("Initializing DMA test module\n");
+    pr_info("Initializing Cyclic DMA test module\n");
 
     // 只能测试从模拟设备到内存
 
-    // 测试从设备到内存的DMA传输
+    // 测试从设备到内存的循环DMA传输
     if (dma_test(DMA_DEV_TO_MEM) < 0) {
-        pr_err("Device to memory DMA test failed\n");
+        pr_err("Device to memory Cyclic DMA test failed\n");
     }
 
     return 0;
@@ -168,7 +162,7 @@ static int __init dma_test_init(void)
 
 static void __exit dma_test_exit(void)
 {
-    pr_info("Exiting DMA test module\n");
+    pr_info("Exiting Cyclic DMA test module\n");
 }
 
 module_init(dma_test_init);
@@ -176,4 +170,4 @@ module_exit(dma_test_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("huangcheng");
-MODULE_DESCRIPTION("DMA slave test module with data verification and physical address handling");
+MODULE_DESCRIPTION("Cyclic DMA test module with data verification and physical address handling");
