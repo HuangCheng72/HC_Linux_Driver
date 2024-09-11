@@ -1079,7 +1079,243 @@ static struct dma_async_tx_descriptor *hc_dma_prep_dma_memcpy(
 static struct dma_async_tx_descriptor *hc_dma_prep_slave_sg(
         struct dma_chan *chan, struct scatterlist *sgl, unsigned int sg_len,
         enum dma_transfer_direction dir, unsigned long flags, void *context) {
-    return NULL;  // 暂时不支持此操作
+
+    // 其实它们都类似，只是描述符的配置不太相同
+    // 本质上来说，真正的差异还是描述符的各项配置
+    // 因此可以直接从memcpy里面复制代码下来改
+
+    // 获取所需的两个指针，设备信息结构体和虚拟通道结构体
+    DMA_DEV_Info *dma_dev = (DMA_DEV_Info *)(chan->device);
+    DMA_Virtual_Channel_Info *vchan = (DMA_Virtual_Channel_Info *)chan;
+
+    // 两种DMA描述符
+
+    DMA_TASK_Descriptor *taskDesc;          // 软件（驱动程序）用的描述符
+    DMA_HardWare_Descriptor *hardwareDesc;  // 硬件用的描述符
+
+    DMA_HardWare_Descriptor *tail = NULL;   // 为了串到链表尾结点用到
+
+    DMA_HardWare_Descriptor *temp_hardwareDesc; // 销毁描述符的时候用到的变量
+
+    // 描述符物理地址
+    dma_addr_t physical_addr;
+
+    // sg链表结点
+    struct scatterlist *sg_node;
+
+    // 计数器
+    uint32_t i;
+
+    // 通道参数，每个描述符都用得到
+    uint32_t src_width;
+    uint32_t dest_width;
+    uint32_t src_burst;
+    uint32_t dest_burst;
+
+    if(!dma_dev || !vchan || !sgl || sg_len == 0) {
+        // 取不到设备信息、取不到虚拟通道、链表不存在或者len是0，就是无效请求，直接返回NULL
+        return NULL;
+    }
+
+    // 在这里检查通道参数是否有效
+    switch (vchan->cfg.src_addr_width) {                        // 源设备位宽（根据DMA_CFG_REG_t 结构体的DMA_SRC_DATA_WIDTH 项要求）
+        case DMA_SLAVE_BUSWIDTH_1_BYTE: {
+            src_width = 0;  // 1字节就是8位
+            break;
+        }
+        case DMA_SLAVE_BUSWIDTH_2_BYTES: {
+            src_width = 1;  // 2字节就是16位
+            break;
+        }
+        case DMA_SLAVE_BUSWIDTH_4_BYTES: {
+            src_width = 2;   // 4字节就是32位
+            break;
+        }
+        case DMA_SLAVE_BUSWIDTH_8_BYTES: {
+            src_width = 3;   // 8字节就是64位
+            break;
+        }
+        default: {
+            // 其他情况无效，直接返回
+            return NULL;
+        }
+    }
+    switch (vchan->cfg.dst_addr_width) {                        // 目标设备位宽（根据DMA_CFG_REG_t 结构体的DMA_DEST_DATA_WIDTH 项要求）
+        case DMA_SLAVE_BUSWIDTH_1_BYTE: {
+            dest_width = 0; // 1字节就是8位
+            break;
+        }
+        case DMA_SLAVE_BUSWIDTH_2_BYTES: {
+            dest_width = 1; // 2字节就是16位
+            break;
+        }
+        case DMA_SLAVE_BUSWIDTH_4_BYTES: {
+            dest_width = 2;  // 4字节就是32位
+            break;
+        }
+        case DMA_SLAVE_BUSWIDTH_8_BYTES: {
+            dest_width = 3;  // 8字节就是64位
+            break;
+        }
+        default: {
+            // 其他情况无效，直接返回
+            return NULL;
+        }
+    }
+    switch (vchan->cfg.src_maxburst) {                          // 源设备突发长度（根据DMA_CFG_REG_t 结构体的DMA_SRC_BST_LEN 项要求）
+        case 1: {
+            src_burst = 0;
+            break;
+        }
+        case 4: {
+            src_burst = 1;
+            break;
+        }
+        case 8: {
+            src_burst = 2;
+            break;
+        }
+        case 16: {
+            src_burst = 3;
+            break;
+        }
+        default: {
+            // 其他情况无效，直接返回
+            return NULL;
+        }
+    }
+    switch (vchan->cfg.dst_maxburst) {                          // 目标设备突发长度（根据DMA_CFG_REG_t 结构体的DMA_DEST_BST_LEN 项要求）
+        case 1: {
+            dest_burst = 0;
+            break;
+        }
+        case 4: {
+            dest_burst = 1;
+            break;
+        }
+        case 8: {
+            dest_burst = 2;
+            break;
+        }
+        case 16: {
+            dest_burst = 3;
+            break;
+        }
+        default: {
+            // 其他情况无效，直接返回
+            return NULL;
+        }
+    }
+
+    // 让内核分配软件描述符内存并初始化清空
+    taskDesc = kzalloc(sizeof(*taskDesc), GFP_NOWAIT);
+    if(!taskDesc) {
+        // 这个不用说，失败返回
+        return NULL;
+    }
+    memset(taskDesc, 0, sizeof(*taskDesc));
+
+    // 通过scatterlist提供的的遍历宏来遍历所有链表（最好专车专用，其实自己钻到底层写while循环也行）
+    for_each_sg(sgl, sg_node, sg_len, i) {
+        // 对于每个结点，就创建一个描述符
+        hardwareDesc = dma_pool_alloc(dma_dev->pool, GFP_NOWAIT, &physical_addr);
+        if (!hardwareDesc) {
+            dev_err(dma_dev->slave.dev, "Failed to alloc DMA_HardWare_Descriptor memory\n");
+            // 失败了就把所有硬件描述符的内存释放了
+
+            // 第一个描述符记录在taskDesc中
+            physical_addr = taskDesc->physical_addr;
+            hardwareDesc = taskDesc->virtual_addr;
+            temp_hardwareDesc = hardwareDesc;
+
+            while(temp_hardwareDesc) {
+                dma_pool_free(dma_dev->pool, hardwareDesc, physical_addr);
+                physical_addr = temp_hardwareDesc->p_next_dma_descriptor;
+                hardwareDesc = temp_hardwareDesc->v_next_dma_descriptor;
+                // 链表结点步进
+                temp_hardwareDesc = hardwareDesc;
+            }
+            // 再释放任务描述符
+            kfree(taskDesc);
+            // 返回NULL
+            return NULL;
+        }
+        memset(hardwareDesc, 0, sizeof(*hardwareDesc));
+
+        // 把软件描述符中的结点信息补上，这是第一个结点
+        if(taskDesc->virtual_addr == NULL) {
+            taskDesc->physical_addr = physical_addr;
+            taskDesc->virtual_addr = hardwareDesc;
+        }
+
+        if(tail) {
+            // 不是第一个结点，需要串到链表末尾
+            tail->p_next_dma_descriptor = physical_addr;
+            tail->v_next_dma_descriptor = hardwareDesc;
+        }
+        // 以下是无论如何都要做的
+
+        tail = hardwareDesc;    // 更新尾结点
+        hardwareDesc->p_next_dma_descriptor = DMA_DESCRIPTOR_END_ADDRESS;   // 新的尾结点当然没有下一个任务了
+        hardwareDesc->v_next_dma_descriptor = NULL; // 同上
+
+        // 根据方向配置硬件描述符各项参数（注意要通过宏提取sg链表结点里面的信息，这是比较推荐的做法，否则需要自己区分各种情况，很麻烦）
+
+        switch (dir) {
+            case DMA_MEM_TO_DEV: {
+                // 源地址是 scatterlist 中的地址，目标地址是设备的地址
+                hardwareDesc->src.DMA_CUR_SRC_ADDR = sg_dma_address(sg_node);
+                hardwareDesc->len = sg_dma_len(sg_node);
+
+                hardwareDesc->para.WAIT_CYC = 8;            // 说明一下，按照参考驱动的源代码，普通等待时间被设置为8，这边有8位，范围就是 0 到 0xff = 255，不敢改，那就还是8吧
+
+                // 从 dma_slave_config 结构体中提取信息
+                hardwareDesc->dst.DMA_CUR_DEST_ADDR = vchan->cfg.dst_addr;  // 目标地址
+
+
+                hardwareDesc->cfg.DMA_SRC_DRQ_TYPE = 1;                 // 内存到设备，源设备肯定是内存，根据DRQ表，当然是1
+                hardwareDesc->cfg.DMA_DEST_DRQ_TYPE = vchan->port;      // 具体看hc_dma_of_xlate写入的是什么
+
+                hardwareDesc->cfg.DMA_SRC_ADDR_MODE = 0;    // 源设备内存当然是线性模式，这不用解释
+                hardwareDesc->cfg.DMA_DEST_ADDR_MODE = 1;   // 目标设备不知道是什么，一律当作IO模式处理
+
+                break;
+            }
+            case DMA_DEV_TO_MEM: {
+                // 源地址是设备的地址，目标地址是 scatterlist 中的地址
+                hardwareDesc->dst.DMA_CUR_DEST_ADDR = sg_dma_address(sg_node);
+                hardwareDesc->len = sg_dma_len(sg_node);
+
+                // 从 dma_slave_config 结构体中提取信息
+                hardwareDesc->src.DMA_CUR_SRC_ADDR = vchan->cfg.src_addr;   // 目标地址
+
+                hardwareDesc->para.WAIT_CYC = 8;            // 说明一下，按照参考驱动的源代码，普通等待时间被设置为8，这边有8位，范围就是 0 到 0xff = 255，不敢改，那就还是8吧
+
+                hardwareDesc->cfg.DMA_SRC_DRQ_TYPE = vchan->port;       // 具体看hc_dma_of_xlate写入的是什么
+                hardwareDesc->cfg.DMA_DEST_DRQ_TYPE = 1;                // 设备到内存，源设备肯定是内存，根据DRQ表，当然是1
+
+                hardwareDesc->cfg.DMA_SRC_ADDR_MODE = 1;    // 源设备不知道是什么，一律当作IO模式处理
+                hardwareDesc->cfg.DMA_DEST_ADDR_MODE = 0;   // 目标设备内存当然是线性模式，这不用解释
+
+                break;
+            }
+            default: {
+                // 目前不支持其他情况，只支持这两个
+                // 我一直觉得该有设备到设备，但是原来的参考代码就没支持
+                break;
+            }
+        }
+
+        // 这些是方向无关的参数
+        hardwareDesc->cfg.DMA_SRC_DATA_WIDTH = src_width;
+        hardwareDesc->cfg.DMA_DEST_DATA_WIDTH = dest_width;
+        hardwareDesc->cfg.DMA_SRC_BST_LEN = src_burst;
+        hardwareDesc->cfg.DMA_DEST_BST_LEN = dest_burst;
+
+    }
+
+    // 让Linux的DMA驱动框架完成后续配置，这里不管了
+    return vchan_tx_prep(&vchan->vc, &taskDesc->vd, flags);
 }
 
 static struct dma_async_tx_descriptor *hc_dma_prep_dma_cyclic(
