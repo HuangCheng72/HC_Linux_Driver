@@ -461,6 +461,20 @@ static void hc_dma_free_chan_resources(struct dma_chan *chan);
 static int hc_dma_start_transfer(DMA_DEV_Info *dma_dev, DMA_Virtual_Channel_Info *vchan);
 static void hc_dma_stop_transfer(DMA_DEV_Info *dma_dev, DMA_Virtual_Channel_Info *vchan);
 
+// 扩展新增的函数声明
+
+static struct dma_async_tx_descriptor *hc_dma_prep_dma_xor(struct dma_chan *chan, dma_addr_t dst, dma_addr_t *src, unsigned int src_cnt, size_t len, unsigned long flags);
+static struct dma_async_tx_descriptor *hc_dma_prep_dma_xor_val(struct dma_chan *chan, dma_addr_t *src,	unsigned int src_cnt, size_t len, enum sum_check_flags *result, unsigned long flags);
+static struct dma_async_tx_descriptor *hc_dma_prep_dma_pq(struct dma_chan *chan, dma_addr_t *dst, dma_addr_t *src, unsigned int src_cnt, const unsigned char *scf, size_t len, unsigned long flags);
+static struct dma_async_tx_descriptor *hc_dma_prep_dma_pq_val(struct dma_chan *chan, dma_addr_t *pq, dma_addr_t *src, unsigned int src_cnt, const unsigned char *scf, size_t len, enum sum_check_flags *pqres, unsigned long flags);
+static struct dma_async_tx_descriptor *hc_dma_prep_dma_memset(struct dma_chan *chan, dma_addr_t dest, int value, size_t len, unsigned long flags);
+static struct dma_async_tx_descriptor *hc_dma_prep_dma_memset_sg(struct dma_chan *chan, struct scatterlist *sg, unsigned int nents, int value, unsigned long flags);
+static struct dma_async_tx_descriptor *hc_dma_prep_dma_interrupt(struct dma_chan *chan, unsigned long flags);
+static struct dma_async_tx_descriptor *hc_dma_prep_dma_sg(struct dma_chan *chan,struct scatterlist *dst_sg, unsigned int dst_nents, struct scatterlist *src_sg, unsigned int src_nents, unsigned long flags);
+static struct dma_async_tx_descriptor *hc_dma_prep_interleaved_dma(struct dma_chan *chan, struct dma_interleaved_template *xt, unsigned long flags);
+static struct dma_async_tx_descriptor *hc_dma_prep_dma_imm_data(struct dma_chan *chan, dma_addr_t dst, uint64_t data, unsigned long flags);
+static void hc_dma_synchronize(struct dma_chan *chan);
+
 // 以下是平台驱动匹配信息
 
 // 目前只支持Allwinner H3平台，所以也只有这个了
@@ -597,48 +611,23 @@ static int hc_dma_probe(struct platform_device *pdev) {
     dma_dev->slave.device_alloc_chan_resources = hc_dma_alloc_chan_resources;     // 分配DMA通道资源
     dma_dev->slave.device_free_chan_resources  = hc_dma_free_chan_resources;      // 释放DMA通道资源
     dma_dev->slave.device_prep_dma_memcpy      = hc_dma_prep_dma_memcpy;          // 准备一个内存拷贝操作
-
-    // 缺失device_prep_dma_xor，该函数用于内存数据块的异或操作（常用于 RAID 校验）。
-    // 主要用于 RAID 系统中，通过异或多个数据块生成校验数据块。
-
-    // 缺失device_prep_dma_xor_val，该函数用于检查多个数据块之间的 XOR 和验证。
-    // 用于验证多个数据块之间的异或校验结果，确保数据完整性，通常在 RAID 校验中使用。
-
-    // 缺失device_prep_dma_pq，该函数用于准备 PQ 操作，常用于高级 RAID 校验（例如 RAID-6）。
-    // PQ 操作涉及两个校验数据块，通常用于 RAID-6 级别的数据校验。
-
-    // 缺失device_prep_dma_pq_val，该函数用于验证 PQ 校验和。
-    // 用于 RAID-6 校验，验证生成的 PQ 校验数据是否正确。
-
-    // 缺失device_prep_dma_memset，该函数用于准备 DMA 内存清零操作（如 memset）。
-    // 通过 DMA 进行内存的填充操作，例如将内存块初始化为一个特定的值（如清零）。
-
-    // 缺失device_prep_dma_memset_sg，该函数用于准备 scatter-gather 形式的内存填充操作。
-    // 类似于 memset，但操作的是一个 scatter-gather 列表，用于分散的内存块进行填充。
-
-    // 缺失device_prep_dma_interrupt，该函数用于准备传输完成时触发的中断。
-    // 当 DMA 操作完成后，通过中断通知处理器，通常用于实时通知系统传输完成。
-
-    // 缺失device_prep_dma_sg，该函数用于准备散列-聚集（scatter-gather）的传输操作。
-    // 用于对分散的内存块进行传输，可以将多个不连续的内存块聚合到一起，或将数据分散到不同块中。
-
+    dma_dev->slave.device_prep_dma_xor         = hc_dma_prep_dma_xor;             // 通过异或多个数据块生成校验数据块
+    dma_dev->slave.device_prep_dma_xor_val     = hc_dma_prep_dma_xor_val;         // 验证多个数据块之间的异或校验结果
+    dma_dev->slave.device_prep_dma_pq          = hc_dma_prep_dma_pq;              // PQ 操作涉及两个校验数据块
+    dma_dev->slave.device_prep_dma_pq_val      = hc_dma_prep_dma_pq_val;          // 验证生成的 PQ 校验数据是否正确
+    dma_dev->slave.device_prep_dma_memset      = hc_dma_prep_dma_memset;          // 通过 DMA 进行内存的填充操作
+    dma_dev->slave.device_prep_dma_memset_sg   = hc_dma_prep_dma_memset_sg;       // 操作的是一个 scatter-gather 列表，用于分散的内存块进行填充
+    dma_dev->slave.device_prep_dma_interrupt   = hc_dma_prep_dma_interrupt;       // 当 DMA 操作完成后，通过中断通知处理器
+    dma_dev->slave.device_prep_dma_sg          = hc_dma_prep_dma_sg;              // 用于对分散的内存块进行传输
     dma_dev->slave.device_prep_slave_sg        = hc_dma_prep_slave_sg;            // 准备一个从设备的scatter-gather传输
     dma_dev->slave.device_prep_dma_cyclic      = hc_dma_prep_dma_cyclic;          // 准备一个循环DMA操作
-
-    // 缺失device_prep_interleaved_dma，该函数用于准备交错传输，适合复杂数据结构。
-    // 用于处理交错数据传输的场景，例如不同步的数据传输，或多个源/目的地址的复杂传输模式。
-
-    // 缺失device_prep_dma_imm_data，该函数用于准备 DMA 的立即数据传输。
-    // 将 8 字节的立即数据传输到目的地址，通常用于传输较小的数据块而不需要大型内存缓冲区。
-
+    dma_dev->slave.device_prep_interleaved_dma = hc_dma_prep_interleaved_dma;     // 该函数用于准备交错传输，适合复杂数据结构
+    dma_dev->slave.device_prep_dma_imm_data    = hc_dma_prep_dma_imm_data;        // 将 8 字节的立即数据传输到目的地址
     dma_dev->slave.device_config               = hc_dma_config;                   // 配置DMA通道
     dma_dev->slave.device_pause                = hc_dma_pause;                    // 暂停DMA传输
     dma_dev->slave.device_resume               = hc_dma_resume;                   // 恢复暂停的DMA传输
     dma_dev->slave.device_terminate_all        = hc_dma_terminate_all;            // 终止所有正在进行的DMA传输
-
-    // 缺失device_synchronize，该函数用于同步DMA的终止操作。
-    // 确保 DMA 通道在终止操作时所有传输任务安全结束，避免数据丢失或资源争用。
-
+    dma_dev->slave.device_synchronize          = hc_dma_synchronize;              // 确保 DMA 通道在终止操作时所有传输任务安全结束，避免数据丢失或资源争用
     dma_dev->slave.device_tx_status            = hc_dma_tx_status;                // 获取DMA传输状态
     dma_dev->slave.device_issue_pending        = hc_dma_issue_pending;            // 推送挂起的DMA传输任务
 
@@ -664,9 +653,13 @@ static int hc_dma_probe(struct platform_device *pdev) {
     // 指定DMA支持的传输方向，通常有：
     // 1. DMA_DEV_TO_MEM: 设备到内存传输。常见于从外设（如UART、I2C）读取数据并写入到内存中。
     // 2. DMA_MEM_TO_DEV: 内存到设备传输。常见于从内存将数据写入外设。
+    // 3. DMA_DEV_TO_DEV: 设备到设备传输。常见于从外设（如UART、I2C）读取数据并写入到其他外设中。
+    // 4. DMA_MEM_TO_MEM: 内存到内存传输。就是memcpy。
     // 这里配置DMA设备支持这两种传输方向（外设到内存和内存到外设）。
     dma_dev->slave.directions                  = BIT(DMA_DEV_TO_MEM) |
-                                                 BIT(DMA_MEM_TO_DEV);
+                                                 BIT(DMA_MEM_TO_DEV) |
+                                                 BIT(DMA_DEV_TO_DEV) |
+                                                 BIT(DMA_MEM_TO_MEM);
 
     // 设置DMA传输的剩余字节粒度。在 DMA 传输的过程中，驱动程序可能会查询剩余的未传输字节数。
     // 这里设置粒度为DMA_RESIDUE_GRANULARITY_BURST，表示传输剩余数据的精确度是基于DMA传输的突发传输（burst），
@@ -2008,3 +2001,192 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("huangcheng, <huangcheng20000702@gmail.com> ");
 MODULE_DESCRIPTION("A dma controller driver for OrangePi One");
 MODULE_VERSION("1.0");
+
+/*
+ * 准备 XOR 操作的 DMA 描述符
+ * 功能：为 XOR 操作分配 DMA 描述符
+ */
+static struct dma_async_tx_descriptor *hc_dma_prep_dma_xor(
+        struct dma_chan *chan, dma_addr_t dst, dma_addr_t *src,
+        unsigned int src_cnt, size_t len, unsigned long flags) {
+
+    // @chan: DMA 通道，用于指定在哪个通道上执行操作
+    // @dst: 目标地址，XOR 结果将写入该地址
+    // @src: 源地址数组，包含执行 XOR 操作的多个源数据块
+    // @src_cnt: 源地址的数量，表示 src 数组中有多少数据块
+    // @len: 数据块长度，表示每个源地址中的数据块长度
+    // @flags: 描述符标志，可能包括 DMA 操作的优先级或模式等
+
+    /* 函数实现逻辑 */
+    return NULL;
+}
+
+/*
+ * 准备 XOR 验证操作的 DMA 描述符
+ * 功能：为 XOR 校验操作分配 DMA 描述符
+ */
+static struct dma_async_tx_descriptor *hc_dma_prep_dma_xor_val(
+        struct dma_chan *chan, dma_addr_t *src, unsigned int src_cnt,
+        size_t len, enum sum_check_flags *result, unsigned long flags) {
+
+    // @chan: DMA 通道，用于指定在哪个通道上执行操作
+    // @src: 源地址数组，包含用于验证的数据块
+    // @src_cnt: 源地址的数量，表示 src 数组中有多少数据块
+    // @len: 数据块长度，表示每个源地址中的数据块长度
+    // @result: 验证结果存储的位置
+    // @flags: 描述符标志，可能包括 DMA 操作的优先级或模式等
+
+    /* 函数实现逻辑 */
+    return NULL;
+}
+
+/*
+ * 准备 PQ 操作的 DMA 描述符
+ * 功能：为 PQ 操作分配 DMA 描述符
+ */
+static struct dma_async_tx_descriptor *hc_dma_prep_dma_pq(
+        struct dma_chan *chan, dma_addr_t *dst, dma_addr_t *src,
+        unsigned int src_cnt, const unsigned char *scf, size_t len, unsigned long flags) {
+
+    // @chan: DMA 通道，用于指定在哪个通道上执行操作
+    // @dst: 目标地址数组，PQ 结果将写入这些地址
+    // @src: 源地址数组，包含 PQ 操作的多个源数据块
+    // @src_cnt: 源地址的数量，表示 src 数组中有多少数据块
+    // @scf: 源系数数组，用于在 PQ 操作中调整权重
+    // @len: 数据块长度，表示每个源地址中的数据块长度
+    // @flags: 描述符标志，可能包括 DMA 操作的优先级或模式等
+
+    /* 函数实现逻辑 */
+    return NULL;
+}
+
+/*
+ * 准备 PQ 校验和验证操作的 DMA 描述符
+ * 功能：为 PQ 校验操作分配 DMA 描述符
+ */
+static struct dma_async_tx_descriptor *hc_dma_prep_dma_pq_val(
+        struct dma_chan *chan, dma_addr_t *pq, dma_addr_t *src,
+        unsigned int src_cnt, const unsigned char *scf, size_t len,
+        enum sum_check_flags *pqres, unsigned long flags) {
+
+    // @chan: DMA 通道，用于指定在哪个通道上执行操作
+    // @pq: 校验数据块地址
+    // @src: 源地址数组，包含执行 PQ 验证的多个数据块
+    // @src_cnt: 源地址的数量，表示 src 数组中有多少数据块
+    // @scf: 源系数数组，用于 PQ 操作
+    // @len: 数据块长度，表示每个源地址中的数据块长度
+    // @pqres: 验证结果存储位置
+    // @flags: 描述符标志，可能包括 DMA 操作的优先级或模式等
+
+    /* 函数实现逻辑 */
+    return NULL;
+}
+
+/*
+ * 准备执行内存填充操作的 DMA 描述符
+ * 功能：为内存填充操作分配 DMA 描述符
+ */
+static struct dma_async_tx_descriptor *hc_dma_prep_dma_memset(
+        struct dma_chan *chan, dma_addr_t dest, int value, size_t len, unsigned long flags) {
+
+    // @chan: DMA 通道，用于指定在哪个通道上执行操作
+    // @dest: 目标内存地址，填充数据将写入该地址
+    // @value: 填充值，将用于填充指定的内存区域
+    // @len: 内存填充的长度
+    // @flags: 描述符标志，可能包括 DMA 操作的优先级或模式等
+
+    /* 函数实现逻辑 */
+    return NULL;
+}
+
+/*
+ * 准备 scatter-gather 形式的内存填充操作的 DMA 描述符
+ * 功能：为 scatter-gather 形式的内存填充操作分配 DMA 描述符
+ */
+static struct dma_async_tx_descriptor *hc_dma_prep_dma_memset_sg(
+        struct dma_chan *chan, struct scatterlist *sg, unsigned int nents,
+        int value, unsigned long flags) {
+
+    // @chan: DMA 通道，用于指定在哪个通道上执行操作
+    // @sg: scatter-gather 列表，包含多个分散的内存块
+    // @nents: scatter-gather 列表中的条目数量
+    // @value: 填充值，将用于填充内存块
+    // @flags: 描述符标志，可能包括 DMA 操作的优先级或模式等
+
+    /* 函数实现逻辑 */
+    return NULL;
+}
+
+/*
+ * 准备传输完成时触发的中断的 DMA 描述符
+ * 功能：为传输完成的中断分配 DMA 描述符
+ */
+static struct dma_async_tx_descriptor *hc_dma_prep_dma_interrupt(
+        struct dma_chan *chan, unsigned long flags) {
+
+    // @chan: DMA 通道，用于指定在哪个通道上执行操作
+    // @flags: 描述符标志，可能包括 DMA 操作的优先级或模式等
+
+    /* 函数实现逻辑 */
+    return NULL;
+}
+
+/*
+ * 准备 scatter-gather 传输操作的 DMA 描述符
+ * 功能：为 scatter-gather 传输分配 DMA 描述符
+ */
+static struct dma_async_tx_descriptor *hc_dma_prep_dma_sg(
+        struct dma_chan *chan, struct scatterlist *dst_sg, unsigned int dst_nents,
+        struct scatterlist *src_sg, unsigned int src_nents, unsigned long flags) {
+
+    // @chan: DMA 通道，用于指定在哪个通道上执行操作
+    // @dst_sg: 目标 scatter-gather 列表，包含写入目标的多个分散数据块
+    // @dst_nents: 目标 scatter-gather 列表中的条目数量
+    // @src_sg: 源 scatter-gather 列表，包含源数据的多个分散数据块
+    // @src_nents: 源 scatter-gather 列表中的条目数量
+    // @flags: 描述符标志，可能包括 DMA 操作的优先级或模式等
+
+    /* 函数实现逻辑 */
+    return NULL;
+}
+
+/*
+ * 准备交错传输操作的 DMA 描述符
+ * 功能：为交错传输分配 DMA 描述符
+ */
+static struct dma_async_tx_descriptor *hc_dma_prep_interleaved_dma(
+        struct dma_chan *chan, struct dma_interleaved_template *xt, unsigned long flags) {
+
+    // @chan: DMA 通道，用于指定在哪个通道上执行操作
+    // @xt: 交错传输模板，包含交错数据传输的相关信息
+    // @flags: 描述符标志，可能包括 DMA 操作的优先级或模式等
+
+    /* 函数实现逻辑 */
+    return NULL;
+}
+
+/*
+ * 准备执行立即数据传输的 DMA 描述符
+ * 功能：为立即数据传输分配 DMA 描述符
+ */
+static struct dma_async_tx_descriptor *hc_dma_prep_dma_imm_data(
+        struct dma_chan *chan, dma_addr_t dst, u64 data, unsigned long flags) {
+
+    // @chan: DMA 通道，用于指定在哪个通道上执行操作
+    // @dst: 目标地址，将写入立即数据
+    // @data: 立即数据，大小为 8 字节
+    // @flags: 描述符标志，可能包括 DMA 操作的优先级或模式等
+
+    /* 函数实现逻辑 */
+    return NULL;
+}
+
+/*
+ * DMA同步函数
+ * 功能：同步 DMA 终止操作，确保传输任务安全结束
+ */
+static void hc_dma_synchronize(struct dma_chan *chan) {
+    // @chan: DMA 通道，用于指定在哪个通道上执行操作
+
+    /* 函数实现逻辑 */
+}
