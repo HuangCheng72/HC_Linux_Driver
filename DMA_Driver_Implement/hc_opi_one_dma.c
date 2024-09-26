@@ -2170,7 +2170,7 @@ static struct dma_async_tx_descriptor *hc_dma_prep_interleaved_dma(
  * 功能：为立即数据传输分配 DMA 描述符
  */
 static struct dma_async_tx_descriptor *hc_dma_prep_dma_imm_data(
-        struct dma_chan *chan, dma_addr_t dst, u64 data, unsigned long flags) {
+        struct dma_chan *chan, dma_addr_t dst, uint64_t data, unsigned long flags) {
 
     // @chan: DMA 通道，用于指定在哪个通道上执行操作
     // @dst: 目标地址，将写入立即数据
